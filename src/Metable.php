@@ -17,6 +17,11 @@ use Traversable;
 trait Metable
 {
     /**
+     * @var array Container for presave meta
+     */
+    protected $_meta = [];
+
+    /**
      * Initialize the trait.
      *
      * @return void
@@ -26,6 +31,10 @@ trait Metable
         // delete all attached meta on deletion
         static::deleted(function (Model $model) {
             $model->purgeMeta();
+        });
+
+        static::saved(function (Model $model) {
+            $model->saveLocalMeta();
         });
     }
 
@@ -45,8 +54,22 @@ trait Metable
      * @param string $key
      * @param mixed  $value
      */
-    public function setMeta(string $key, $value)
+    public function setMeta(string $key, $value) {
+        $this->_meta[$key] = $this->makeMeta($key, $value);
+    }
+
+    /**
+     * Persist the value of the `Meta` at a given key to the meta table.
+     *
+     * @param string $key
+     * @param mixed  $value
+     */
+    public function saveMeta(string $key, $value)
     {
+        // Disallow for non existing model
+        if(!$this->exists)
+            throw new \Exception("Cannot persist meta to database on non existing model");
+
         if ($this->hasMeta($key)) {
             $meta = $this->getMetaRecord($key);
             $meta->setAttribute('value', $value);
@@ -55,6 +78,8 @@ trait Metable
             $meta = $this->makeMeta($key, $value);
             $this->meta()->save($meta);
         }
+
+        unset($this->_meta[$key]);
 
         // Update cached relationship, if necessary.
         if ($this->relationLoaded('meta')) {
@@ -65,12 +90,32 @@ trait Metable
     /**
      * Replace all associated `Meta` with the keys and values provided.
      *
+     * @param array $array
+     */
+    public function syncMeta(array $array) {
+
+        $meta = [];
+
+        foreach ($array as $key => $value) {
+            $meta[$key] = $this->makeMeta($key, $value);
+        }
+
+        $this->_meta = $meta;
+    }
+
+    /**
+     * Replace all associated `Meta` with the keys and values provided directly with meta table.
+     *
      * @param array|Traversable $array
      *
      * @return void
      */
-    public function syncMeta($array)
+    public function saveSyncMeta($array)
     {
+        // Disallow for non existing model
+        if(!$this->exists)
+            throw new \Exception("Cannot persist meta to database on non existing model");
+
         $meta = [];
 
         foreach ($array as $key => $value) {
@@ -83,6 +128,38 @@ trait Metable
         // Update cached relationship.
         $collection = $this->makeMeta()->newCollection($meta);
         $this->setRelation('meta', $collection);
+        $this->_meta = [];
+    }
+
+    public function saveMetaArray($array) {
+        // Disallow for non existing model
+        if(!$this->exists)
+            throw new \Exception("Cannot persist meta to database on non existing model");
+
+        $meta = [];
+
+        foreach ($array as $key => $value) {
+            $meta[$key] = $this->makeMeta($key, $value);
+        }
+
+        $this->meta()->saveMany($meta);
+
+        // Update cached relationship.
+        foreach($meta as $key => $item) {
+            $this->meta[$key] = $item;
+        }
+        $this->_meta = [];
+    }
+
+    /**
+     * Update all meta including local unsaved
+     *
+     * @throws \Exception
+     */
+    public function saveLocalMeta() {
+        if($this->exists() && count($this->_meta)) {
+            $this->saveSyncMeta($this->getAllMeta());
+        }
     }
 
     /**
@@ -109,9 +186,16 @@ trait Metable
      */
     public function getAllMeta()
     {
-        return $this->getMetaCollection()->toBase()->map(function (Meta $meta) {
+        $metaFromRelation = $this->getMetaCollection()->toBase()->map(function (Meta $meta) {
+            // Populate with data from db relation
             return $meta->getAttribute('value');
         });
+
+        foreach($this->_meta as $key => $meta) {
+            $metaFromRelation[$key] = $meta->getAttribute('value');
+        }
+
+        return $metaFromRelation;
     }
 
     /**
@@ -123,7 +207,7 @@ trait Metable
      */
     public function hasMeta(string $key) : bool
     {
-        return $this->getMetaCollection()->has($key);
+        return $this->getMetaCollection()->has($key) ?: isset($this->_meta[$key]);
     }
 
     /**
@@ -135,6 +219,7 @@ trait Metable
      */
     public function removeMeta(string $key)
     {
+        unset($this->_meta[$key]);
         $this->getMetaCollection()->pull($key)->delete();
     }
 
@@ -146,6 +231,7 @@ trait Metable
     public function purgeMeta()
     {
         $this->meta()->delete();
+        $this->_meta = [];
         $this->setRelation('meta', $this->makeMeta()->newCollection([]));
     }
 
@@ -158,6 +244,10 @@ trait Metable
      */
     public function getMetaRecord(string $key)
     {
+        // Attempt to find in local unsaved meta first
+        if(isset($this->_meta[$key])) return $this->_meta[$key];
+
+        // Get meta record from database relation collection
         return $this->getMetaCollection()->get($key);
     }
 
@@ -360,11 +450,22 @@ trait Metable
      */
     private function getMetaCollection()
     {
+        // Set relation if relation is not loaded
         if (!$this->relationLoaded('meta')) {
             $this->setRelation('meta', $this->meta()->get());
         }
 
-        return $this->getRelation('meta');
+        $meta = [];
+
+        // If relation is loaded return relation collection
+        if($this->relationLoaded('meta'))
+            $meta = $this->getRelation('meta');
+
+        foreach($this->_meta as $key => $metaItem) {
+            $meta[$key] = $metaItem;
+        }
+
+        return $meta;
     }
 
     /**
